@@ -8,7 +8,7 @@ OS = $(shell go env GOOS)
 ARCH = $(shell go env GOARCH)
 
 # Current Operator version
-IMAGE_VERSION ?= 2.3.0-dev
+IMAGE_VERSION ?= 2.4.0-dev
 BUNDLE_VERSION ?= $(IMAGE_VERSION)
 DEFAULT_NAMESPACE ?= quay.io/cryostat
 IMAGE_NAMESPACE ?= $(DEFAULT_NAMESPACE)
@@ -85,7 +85,7 @@ ENVTEST_K8S_VERSION ?= 1.26
 # See: https://github.com/operator-framework/operator-sdk/pull/4762
 #
 # Suffix is the timestamp of the image build, compute with: date -u '+%Y%m%d%H%M%S'
-CUSTOM_SCORECARD_VERSION ?= 2.3.0-$(shell date -u '+%Y%m%d%H%M%S')
+CUSTOM_SCORECARD_VERSION ?= 2.4.0-$(shell date -u '+%Y%m%d%H%M%S')
 export CUSTOM_SCORECARD_IMG ?= $(IMAGE_TAG_BASE)-scorecard:$(CUSTOM_SCORECARD_VERSION)
 
 DEPLOY_NAMESPACE ?= cryostat-operator-system
@@ -138,7 +138,7 @@ ifneq ($(SKIP_TESTS), true)
 	operator-sdk run bundle -n $(SCORECARD_NAMESPACE) $(BUNDLE_IMG)
 	$(call scorecard-cleanup); \
 	trap cleanup EXIT; \
-	operator-sdk scorecard -n $(SCORECARD_NAMESPACE) -s cryostat-scorecard -w 10m $(BUNDLE_IMG) --pod-security=restricted
+	operator-sdk scorecard -n $(SCORECARD_NAMESPACE) -s cryostat-scorecard -w 20m $(BUNDLE_IMG) --pod-security=restricted
 endif
 
 .PHONY: clean-scorecard
@@ -242,7 +242,7 @@ oci-build: manifests generate fmt vet test-envtest
 	BUILDAH_FORMAT=docker $(IMAGE_BUILDER) build --build-arg TARGETOS=$(OS) --build-arg TARGETARCH=$(ARCH) -t $(OPERATOR_IMG) .
 
 # PLATFORMS defines the target platforms for the manager image to provide support to multiple
-# architectures. (i.e. make oci-buildx OPERATOR_IMG=quay.io/cryostat/cryostat-operator:2.3.0).
+# architectures. (i.e. make oci-buildx OPERATOR_IMG=quay.io/cryostat/cryostat-operator:latest).
 # You need to be able to push the image for your registry (i.e. if you do not inform a valid value via OPERATOR_IMG=<myregistry/image:<tag>> than the export will fail)
 # If IMAGE_BUILDER is docker, you need to:
 # - able to use docker buildx. More info: https://docs.docker.com/build/buildx/
@@ -418,14 +418,10 @@ scorecard-build: custom-scorecard-tests
 # Local development/testing helpers
 
 .PHONY: sample_app
-sample_app: undeploy_sample_app
-	$(call new-sample-app,quay.io/andrewazores/vertx-fib-demo:0.9.1)
-	$(CLUSTER_CLIENT) patch svc/vertx-fib-demo -p '{"spec":{"$setElementOrder/ports":[{"port":8080},{"port":8443},{"port":9093}],"ports":[{"name":"jfr-jmx","port":9093}]}}'
-	$(CLUSTER_CLIENT) patch deployment/vertx-fib-demo -p '{"spec":{"template":{"spec":{"$setElementOrder/containers":[{"name":"vertx-fib-demo"}],"containers":[{"name":"vertx-fib-demo","env":[{"name":"USE_AUTH","value":"true"}],"resources":{"limits":{"cpu":"200m","memory":"256Mi"}}}]}}}}'
+sample_app: sample_app_quarkus
 
 .PHONY: undeploy_sample_app
-undeploy_sample_app:
-	- $(CLUSTER_CLIENT) delete all -l app=vertx-fib-demo
+undeploy_sample_app: undeploy_sample_app_quarkus
 
 .PHONY: sample_app_quarkus
 sample_app_quarkus: undeploy_sample_app_quarkus
@@ -435,6 +431,23 @@ sample_app_quarkus: undeploy_sample_app_quarkus
 .PHONY: undeploy_sample_app_quarkus
 undeploy_sample_app_quarkus:
 	- $(CLUSTER_CLIENT) delete all -l app=quarkus-test
+
+.PHONY: sample_app_agent
+sample_app_agent: undeploy_sample_app_agent
+	@if [ -z "${AUTH_TOKEN}" ]; then \
+		if [ "${CLUSTER_CLIENT}" = "oc" ]; then\
+			AUTH_TOKEN=`oc whoami -t | base64`; \
+		else \
+			echo "'AUTH_TOKEN' must be specified."; \
+			exit 1; \
+		fi; \
+	fi; \
+	$(CLUSTER_CLIENT) create -f config/samples/sample-app-agent.yml; \
+	$(CLUSTER_CLIENT) set env deployment/quarkus-test-agent CRYOSTAT_AGENT_AUTHORIZATION="Bearer $(AUTH_TOKEN)"
+
+.PHONY: undeploy_sample_app_agent
+undeploy_sample_app_agent:
+	- $(CLUSTER_CLIENT) delete -f config/samples/sample-app-agent.yml
 
 define new-sample-app
 @if [ ! "$(CLUSTER_CLIENT)" = "oc" ]; then echo "CLUSTER_CLIENT must be 'oc' for sample app deployments" && exit 1; fi
