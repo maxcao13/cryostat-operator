@@ -18,7 +18,7 @@ IMAGE_TAG_BASE ?= $(IMAGE_NAMESPACE)/$(OPERATOR_NAME)
 
 # Default bundle image tag
 BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:$(BUNDLE_VERSION)
-BUNDLE_IMGS ?= $(BUNDLE_IMG) 
+BUNDLE_IMGS ?= $(BUNDLE_IMG)
 
 # Default catalog image tag
 CATALOG_IMG ?= $(IMAGE_TAG_BASE)-catalog:$(BUNDLE_VERSION) 
@@ -130,12 +130,7 @@ endif
 .PHONY: test-scorecard
 test-scorecard: check_cert_manager kustomize
 ifneq ($(SKIP_TESTS), true)
-	@$(CLUSTER_CLIENT) get namespace $(SCORECARD_NAMESPACE) >/dev/null 2>&1 &&\
-		echo "$(SCORECARD_NAMESPACE) namespace already exists, please remove it with \"make clean-scorecard\"" >&2 && exit 1 || true
-	$(CLUSTER_CLIENT) create namespace $(SCORECARD_NAMESPACE)
-	cd internal/images/custom-scorecard-tests/rbac/ && $(KUSTOMIZE) edit set namespace $(SCORECARD_NAMESPACE)
-	$(KUSTOMIZE) build internal/images/custom-scorecard-tests/rbac/ | $(CLUSTER_CLIENT) apply -f -
-	operator-sdk run bundle -n $(SCORECARD_NAMESPACE) $(BUNDLE_IMG)
+	$(call scorecard-setup)
 	$(call scorecard-cleanup); \
 	trap cleanup EXIT; \
 	operator-sdk scorecard -n $(SCORECARD_NAMESPACE) -s cryostat-scorecard -w 20m $(BUNDLE_IMG) --pod-security=restricted
@@ -145,12 +140,31 @@ endif
 clean-scorecard:
 	- $(call scorecard-cleanup); cleanup
 
+ifneq ($(and $(SCORECARD_REGISTRY_SERVER),$(SCORECARD_REGISTRY_USERNAME),$(SCORECARD_REGISTRY_PASSWORD)),)
+SCORECARD_ARGS := --pull-secret-name registry-key --service-account cryostat-scorecard
+endif
+
+define scorecard-setup
+@$(CLUSTER_CLIENT) get namespace $(SCORECARD_NAMESPACE) >/dev/null 2>&1 &&\
+	echo "$(SCORECARD_NAMESPACE) namespace already exists, please remove it with \"make clean-scorecard\"" >&2 && exit 1 || true
+$(CLUSTER_CLIENT) create namespace $(SCORECARD_NAMESPACE)
+cd internal/images/custom-scorecard-tests/rbac/ && $(KUSTOMIZE) edit set namespace $(SCORECARD_NAMESPACE)
+$(KUSTOMIZE) build internal/images/custom-scorecard-tests/rbac/ | $(CLUSTER_CLIENT) apply -f -
+@if [ -n "$(SCORECARD_ARGS)" ]; then \
+	$(CLUSTER_CLIENT) create -n $(SCORECARD_NAMESPACE) secret docker-registry registry-key --docker-server="$(SCORECARD_REGISTRY_SERVER)" \
+		--docker-username="$(SCORECARD_REGISTRY_USERNAME)" --docker-password="$(SCORECARD_REGISTRY_PASSWORD)"; \
+	$(CLUSTER_CLIENT) patch sa cryostat-scorecard -n $(SCORECARD_NAMESPACE) -p '{"imagePullSecrets": [{"name": "registry-key"}]}'; \
+fi
+operator-sdk run bundle -n $(SCORECARD_NAMESPACE) --timeout 20m $(BUNDLE_IMG) $(SCORECARD_ARGS)
+endef
+
 define scorecard-cleanup
 function cleanup { \
 	(\
 	set +e; \
 	operator-sdk cleanup -n $(SCORECARD_NAMESPACE) $(OPERATOR_NAME); \
 	$(KUSTOMIZE) build internal/images/custom-scorecard-tests/rbac/ | $(CLUSTER_CLIENT) delete --ignore-not-found=$(ignore-not-found) -f -; \
+	$(CLUSTER_CLIENT) delete --ignore-not-found=$(ignore-not-found) -n $(SCORECARD_NAMESPACE) secret registry-key; \
 	$(CLUSTER_CLIENT) delete --ignore-not-found=$(ignore-not-found) namespace $(SCORECARD_NAMESPACE); \
 	)\
 }
@@ -416,21 +430,17 @@ scorecard-build: custom-scorecard-tests
 	-f internal/images/custom-scorecard-tests/Dockerfile .
 
 # Local development/testing helpers
+ifneq ($(origin SAMPLE_APP_NAMESPACE), undefined)
+SAMPLE_APP_FLAGS += -n $(SAMPLE_APP_NAMESPACE)
+endif
 
 .PHONY: sample_app
-sample_app: sample_app_quarkus
+sample_app:
+	$(CLUSTER_CLIENT) apply $(SAMPLE_APP_FLAGS) -f config/samples/sample-app.yaml 
 
 .PHONY: undeploy_sample_app
-undeploy_sample_app: undeploy_sample_app_quarkus
-
-.PHONY: sample_app_quarkus
-sample_app_quarkus: undeploy_sample_app_quarkus
-	$(call new-sample-app,quay.io/andrewazores/quarkus-test:0.0.10)
-	$(CLUSTER_CLIENT) patch svc/quarkus-test -p '{"spec":{"$setElementOrder/ports":[{"port":9097},{"port":8080}],"ports":[{"name":"jfr-jmx","port":9097}]}}'
-
-.PHONY: undeploy_sample_app_quarkus
-undeploy_sample_app_quarkus:
-	- $(CLUSTER_CLIENT) delete all -l app=quarkus-test
+undeploy_sample_app:
+	$(CLUSTER_CLIENT) delete $(SAMPLE_APP_FLAGS) --ignore-not-found=$(ignore-not-found) -f config/samples/sample-app.yaml
 
 .PHONY: sample_app_agent
 sample_app_agent: undeploy_sample_app_agent
@@ -442,14 +452,9 @@ sample_app_agent: undeploy_sample_app_agent
 			exit 1; \
 		fi; \
 	fi; \
-	$(CLUSTER_CLIENT) create -f config/samples/sample-app-agent.yml; \
-	$(CLUSTER_CLIENT) set env deployment/quarkus-test-agent CRYOSTAT_AGENT_AUTHORIZATION="Bearer $(AUTH_TOKEN)"
+	$(CLUSTER_CLIENT) apply $(SAMPLE_APP_FLAGS) -f config/samples/sample-app-agent.yaml; \
+	$(CLUSTER_CLIENT) set env $(SAMPLE_APP_FLAGS) deployment/quarkus-test-agent CRYOSTAT_AGENT_AUTHORIZATION="Bearer $(AUTH_TOKEN)"
 
 .PHONY: undeploy_sample_app_agent
 undeploy_sample_app_agent:
-	- $(CLUSTER_CLIENT) delete -f config/samples/sample-app-agent.yml
-
-define new-sample-app
-@if [ ! "$(CLUSTER_CLIENT)" = "oc" ]; then echo "CLUSTER_CLIENT must be 'oc' for sample app deployments" && exit 1; fi
-$(CLUSTER_CLIENT) new-app $(1)
-endef
+	- $(CLUSTER_CLIENT) delete $(SAMPLE_APP_FLAGS) --ignore-not-found=$(ignore-not-found) -f config/samples/sample-app-agent.yaml
